@@ -2,7 +2,7 @@ SEED = 42
 # BATCH_SIZE = 32        # ค่า default สำหรับวิธีอื่น
 
 # --- Networking / Fed settings ---
-SERVER_IP   = "192.168.1.45"   # เปลี่ยนให้ตรงกับเครื่อง Server
+SERVER_IP   = "192.168.1.49"   # เปลี่ยนให้ตรงกับเครื่อง Server
 SERVER_PORT = 55552
 NUM_CLIENTS = 2
 # ROUNDS      = 5                 # จำนวนรอบ FedAvg
@@ -73,11 +73,12 @@ LORA_ZO = {
 # FED_FULL_BP 
 FED_FULL_BP = {
 
-    "ROUNDS":       10,        # จำนวนรอบ FedAvg
-    "LOCAL_STEPS":  10,       # จำนวน step ที่ client train ต่อรอบ
+    "ROUNDS":       20,        # จำนวนรอบ FedAvg
+    "LOCAL_STEPS":  10,       # จำนวน step ที่ client train ต่อรอบ 30 ok
     "LOG_EVERY":    2,        # log ทุกกี่ step
     "BATCH_SIZE":   4,        # batch size ต่อรอบ
     "LEARNING_RATE": 5e-5,    # learning rate ต่อรอบ
+    "SAVE_MODEL":   False
       
 }
 
