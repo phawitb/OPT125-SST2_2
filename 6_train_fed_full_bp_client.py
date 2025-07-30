@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # bp_client.py <cid> [--use_cpu] -- client trains after GLOBAL and sends LOCAL back
-# Logs to output/train_{id}/client_{cid}_fed_bp.csv
 
-import sys, socket, json, torch, random, numpy as np, time, csv, psutil, os, shutil
+import sys, socket, json, torch, random, numpy as np, time, csv, psutil, os, shutil, hashlib
 from pathlib import Path
 from transformers import (
     AutoTokenizer,
@@ -12,7 +11,6 @@ from transformers import (
 )
 from torch.utils.data import DataLoader
 from datasets import load_from_disk
-
 from bp_comm import send_json, recv_json, send_file, recv_file
 import config
 from datetime import datetime
@@ -71,16 +69,19 @@ cfg_dst = run_dir / "config_client_copy.py"
 if not cfg_dst.exists() and Path("config.py").exists():
     shutil.copy("config.py", cfg_dst)
 
+# --------- HELPERS ---------
+def now(): return datetime.now().strftime("%H:%M:%S")
+def mb(b): return f"{b / 1024 / 1024:.2f} MB"
+def sha256sum(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
 # --------- LOADER SETUP ---------
 tokenizer = AutoTokenizer.from_pretrained(TOK_DIR)
 ds = load_from_disk(str(DATA_DIR))
 train_shard = ds["train"].shard(num_shards=NUM_CLIENTS, index=CID % NUM_CLIENTS)
 loader = DataLoader(train_shard, batch_size=BATCH_SIZE, shuffle=True,
                     collate_fn=default_data_collator)
-
-# --------- HELPERS ---------
-def now(): return datetime.now().strftime("%H:%M:%S")
-def mb(b): return f"{b / 1024 / 1024:.2f} MB"
 
 def local_train(model) -> float:
     model.train()
@@ -134,10 +135,13 @@ def main():
                 print(f"[{now()}] [Client {CID}] Received global ({mb(size_recv)}) in {t_recv:.3f}s")
 
                 try:
-                    sd = torch.load(global_path, map_location=DEVICE, weights_only=True)
-                except TypeError:
                     sd = torch.load(global_path, map_location=DEVICE)
+                except Exception as e:
+                    print(f"[Client {CID}] ERROR loading global weights: {e}")
+                    raise
                 model.load_state_dict(sd)
+                hash_global = sha256sum(global_path)
+                print(f"[{now()}] [Client {CID}] SHA256 of received global: {hash_global}")
                 os.remove(global_path)
 
                 print(f"[{now()}] [Client {CID}] Starting local training...")
@@ -149,6 +153,9 @@ def main():
 
                 out_path = run_dir / f"local_c{CID}_r{round_id}.pt"
                 torch.save(model.state_dict(), out_path)
+                hash_local = sha256sum(out_path)
+                print(f"[{now()}] [Client {CID}] SHA256 of local model to send: {hash_local}")
+
                 if SAVE_MODEL:
                     print(f"[{now()}] [Client {CID}] Saved local model: {out_path.name}")
                 else:
