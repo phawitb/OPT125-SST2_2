@@ -2,7 +2,7 @@ SEED = 42
 # BATCH_SIZE = 32        # ค่า default สำหรับวิธีอื่น
 
 # --- Networking / Fed settings ---
-SERVER_IP   = "192.168.1.49"   # เปลี่ยนให้ตรงกับเครื่อง Server
+SERVER_IP   = "192.168.1.50"   # เปลี่ยนให้ตรงกับเครื่อง Server
 SERVER_PORT = 55552
 NUM_CLIENTS = 2
 # ROUNDS      = 5                 # จำนวนรอบ FedAvg
@@ -81,6 +81,73 @@ FED_FULL_BP = {
     "SAVE_MODEL":   False
       
 }
+
+FED_LORA_BP = {
+    "ROUNDS":        20,
+    "LOCAL_STEPS":   50,
+    "LOG_EVERY":     2,
+    "BATCH_SIZE":    4,
+    "LEARNING_RATE": 5e-5,
+    "SAVE_MODEL":    False,
+
+    # LoRA hyperparams (fallback to ZO_LORA or internal defaults if missing)
+    "LORA_R":        16,
+    "LORA_ALPHA":    32,
+    "LORA_DROPOUT":  0.1,
+}
+
+FED_FULL_ZO = {
+    "ROUNDS":        20,     # จำนวนรอบ FedAvg
+    "LOCAL_STEPS":   50,     # ZO steps/รอบ ต่อ client
+    "BATCH_SIZE":    16,     # batch ของ client
+    "LEARNING_RATE": 1e-4,
+    "WEIGHT_DECAY":  0.0,
+    "MU":            1e-3,
+    "P":             5,      # จำนวนทิศทางรบกวน/สเต็ป
+    "LOG_EVERY":     10,
+    "EVAL_BATCH_SIZE": 64,   # server eval
+    "SAVE_MODEL":    False,
+}
+
+FED_ZO_LORA = {
+    "ROUNDS":        50,     # จำนวนรอบ FedAvg
+    "LOCAL_STEPS":   200,     # ZO steps ต่อรอบ/คลายเริ่มจาก 20-50
+    "BATCH_SIZE":    8,
+    "EVAL_BATCH_SIZE": 64,
+    "LEARNING_RATE": 3e-5, #1e-4,
+    "WEIGHT_DECAY":  1e-2, #0.0,
+    "MU":            1e-4, #1e-3,
+    "P":             10,      # ทิศทางสุ่ม/สเต็ป
+    "LOG_EVERY":     10,
+    "LORA_R":        16,
+    "LORA_ALPHA":    32,
+    "LORA_DROPOUT":  0.1,
+    "SAVE_MODEL":    False,
+}
+
+
+# และกำหนด SERVER_IP, SERVER_PORT, NUM_CLIENTS ให้ตรงทุกเครื่อง
+# LORA_ZO = {
+#     "BATCH_SIZE":    8,
+#     "LEARNING_RATE": 3e-5, #5e-5,
+#     "WEIGHT_DECAY":  1e-2, #0.0,
+#     "MAX_STEPS":     10000,
+#     "EVAL_EVERY":    100,
+#     "LOG_EVERY":     10,
+#     "SAVE_EVERY":    10000,
+#     "GRAD_ACCUM":    1,
+#     "MU":            1e-4,
+#     "P":             10,
+
+#     "LORA_R":        16,
+#     "LORA_ALPHA":    32,
+#     "LORA_DROPOUT":  0.1, 
+# }
+
+# และตั้ง SERVER_IP, SERVER_PORT, NUM_CLIENTS ให้ตรงกันทุกเครื่อง
+
+
+
 
 # FED_FULL_BP = {
 

@@ -1,174 +1,222 @@
 #!/usr/bin/env python3
-# zo_server.py -- ZO-SGD Server: send GLOBAL → recv LOCAL → avg → eval → log
+# FedAvg Server for FULL ZO-SGD (sends/receives full parameter vector and averages)
 
-import socket, torch, json, time, os, shutil, csv, psutil
+import os, sys, json, csv, time, socket, shutil, hashlib, threading, psutil
+from datetime import datetime
 from pathlib import Path
-from datasets import load_from_disk
+from typing import List
+
+import torch
 from torch.utils.data import DataLoader
-from transformers import (
-    AutoModelForSequenceClassification,
-    default_data_collator,
-)
-from zo_comm import send_json, recv_json, send_file, recv_file
+from transformers import AutoModelForSequenceClassification, default_data_collator
+from datasets import load_from_disk
+
+from bp_comm import send_json, recv_json, send_file, recv_file
 import config
 
-# ---------------- SETUP ----------------
+# -------------------- CONFIG --------------------
+USE_CPU     = "--use_cpu" in sys.argv
 HOST        = "0.0.0.0"
 PORT        = config.SERVER_PORT
 NUM_CLIENTS = config.NUM_CLIENTS
-ROUNDS      = config.ROUNDS
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-LR          = config.ZO.get("LEARNING_RATE", 1e-4)
 
+FL = getattr(config, "FED_FULL_ZO", getattr(config, "FULL_ZO", {}))
+ROUNDS       = FL.get("ROUNDS", 20)            # federated rounds
+BATCH_SIZE   = FL.get("EVAL_BATCH_SIZE", 64)   # server eval only
+SAVE_MODEL   = FL.get("SAVE_MODEL", False)
+SEED         = getattr(config, "SEED", 42)
+
+DEVICE = "cpu" if USE_CPU else ("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---- artifacts ----
 ART_DIR   = Path("artifacts_custom")
 META      = json.loads((ART_DIR / "meta.json").read_text())
 MODEL_DIR = Path(META["model_dir"])
 DATA_DIR  = Path(META["dataset_dir"])
 
-# ---------------- OUT DIR ----------------
+# ---- output ----
 base_output_dir = Path("output/fed_full_zo/server")
-base_output_dir.mkdir(exist_ok=True)
+base_output_dir.mkdir(parents=True, exist_ok=True)
 runs = [d for d in base_output_dir.iterdir() if d.name.startswith("train_")]
 next_id = max([int(d.name.split("_")[1]) for d in runs], default=0) + 1
 run_dir = base_output_dir / f"train_{next_id}"
 run_dir.mkdir(parents=True, exist_ok=True)
+if Path("config.py").exists():
+    shutil.copy("config.py", run_dir / "config.py")
 
-shutil.copy("config.py", run_dir / "config.py")
-log_path = run_dir / "log_fed_zo.csv"
+log_csv = run_dir / "log_fed_full_zo.csv"
+fieldnames = [
+    "round","train_acc","val_acc","test_acc","timestamp",
+    "avg_vec_mb_sent","avg_vec_mb_recv","mem_mb","avg_eval_time_sec"
+] + [f"sent_MB_C{i}" for i in range(NUM_CLIENTS)] \
+  + [f"send_time_C{i}" for i in range(NUM_CLIENTS)] \
+  + [f"recv_MB_C{i}" for i in range(NUM_CLIENTS)] \
+  + [f"recv_time_C{i}" for i in range(NUM_CLIENTS)]
+with open(log_csv, "w", newline="") as f:
+    csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
-with open(log_path, "w", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=[
-        "step", "loss", "lr", "train_acc", "val_acc", "test_acc", "timestamp",
-        "computation_time", "communication_time", "memory_mb"
-    ])
-    writer.writeheader()
-
-# ---------------- DATA ----------------
-ds = load_from_disk(str(DATA_DIR))
-train_loader = DataLoader(ds["train"], batch_size=64, shuffle=False,
-                          collate_fn=default_data_collator)
-val_loader   = DataLoader(ds["validation"], batch_size=64, shuffle=False,
-                          collate_fn=default_data_collator)
-test_loader  = DataLoader(ds["test"], batch_size=64, shuffle=False,
-                          collate_fn=default_data_collator)
-
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR).to(DEVICE)
+# -------------------- HELPERS --------------------
+def now(): return datetime.now().strftime("%H:%M:%S")
+def mb(nbytes): return nbytes / 1024 / 1024
+def sha256sum(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fp:
+        for chunk in iter(lambda: fp.read(1<<20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 @torch.inference_mode()
-def evaluate(loader):
+def eval_acc(model, loader, device):
     model.eval()
-    correct = total = 0
+    total = correct = 0
     for batch in loader:
-        labels = batch.pop("labels").to(DEVICE)
-        inputs = {k: v.to(DEVICE) for k, v in batch.items()}
-        logits = model(**inputs).logits
+        labels = batch.pop("labels").to(device)
+        batch  = {k: v.to(device) for k, v in batch.items()}
+        logits = model(**batch).logits
         correct += (logits.argmax(-1) == labels).sum().item()
-        total += labels.size(0)
+        total   += labels.size(0)
     return correct / total
 
-@torch.inference_mode()
-def compute_loss(loader):
-    model.eval()
-    total_loss = 0
-    total = 0
-    for batch in loader:
-        labels = batch.pop("labels").to(DEVICE)
-        inputs = {k: v.to(DEVICE) for k, v in batch.items()}
-        out = model(**inputs, labels=labels)
-        total_loss += out.loss.item() * labels.size(0)
-        total += labels.size(0)
-    return total_loss / total
+# ---- flatten/unflatten based on model parameter order ----
+def params_to_vector(model) -> torch.Tensor:
+    return torch.cat([p.detach().view(-1) for p in model.parameters()])
 
-def avg_state_dict(list_of_sd):
-    avg = {}
-    for k in list_of_sd[0].keys():
-        avg[k] = sum(sd[k] for sd in list_of_sd) / len(list_of_sd)
-    return avg
+def vector_to_params_(model, vec: torch.Tensor):
+    # in-place copy from vec to model.parameters()
+    with torch.no_grad():
+        offset = 0
+        for p in model.parameters():
+            num = p.numel()
+            p.copy_(vec[offset:offset+num].view_as(p))
+            offset += num
 
-# ---------------- MAIN ----------------
-def mb(b): return f"{b/1024/1024:.2f} MB"
+# -------------------- LOAD DATA/MODEL --------------------
+torch.manual_seed(SEED)
+ds = load_from_disk(str(DATA_DIR))
+eval_train = DataLoader(ds["train"].shuffle(seed=SEED).select(range(600)), batch_size=BATCH_SIZE,
+                        shuffle=False, collate_fn=default_data_collator)
+eval_val   = DataLoader(ds["validation"], batch_size=BATCH_SIZE, shuffle=False,
+                        collate_fn=default_data_collator)
+eval_test  = DataLoader(ds["test"], batch_size=BATCH_SIZE, shuffle=False,
+                        collate_fn=default_data_collator)
 
+server_model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR, local_files_only=True).to(DEVICE)
+
+# initial global vector
+global_vec = params_to_vector(server_model).cpu()
+gpath = run_dir / "global_r0.pt"
+torch.save(global_vec, gpath)
+
+proc = psutil.Process(os.getpid())
+
+# -------------------- MAIN --------------------
 def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((HOST, PORT))
-    server.listen(NUM_CLIENTS)
-    print(f"[Server] Listening on {HOST}:{PORT}")
+    print(f"[{now()}] [Server] Starting on {DEVICE}")
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind((HOST, PORT)); srv.listen(NUM_CLIENTS)
 
     conns = []
-    for i in range(NUM_CLIENTS):
-        conn, addr = server.accept()
-        print(f"[Server] Client {i} connected from {addr}")
-        conns.append((i, conn))
+    for cid in range(NUM_CLIENTS):
+        conn, addr = srv.accept()
+        print(f"[{now()}] [Server] Client {cid} connected from {addr}")
+        conns.append((cid, conn))
 
-    proc = psutil.Process(os.getpid())
-    global_path = run_dir / "global_r0.pt"
-    torch.save(model.state_dict(), global_path)
+    current_global_path = str(gpath)
 
-    for r in range(1, ROUNDS + 1):
-        print(f"\nRound {r}")
-        comm_t = 0.0
+    for r in range(1, ROUNDS+1):
+        print(f"\n[{now()}] [Server] === ROUND {r} START ===")
+        round_stats = {}
 
-        # === Send GLOBAL ===
-        for cid, conn in conns:
-            send_json(conn, {"cmd": "GLOBAL", "round": r})
-            sz, t = send_file(conn, str(global_path))
-            comm_t += t
-            print(f"[Server→C{cid}] global {mb(sz)} in {t:.2f}s")
+        # ---- SEND GLOBAL VEC ----
+        path_to_send = current_global_path
+        def send_task(cid, conn, path=path_to_send):
+            send_json(conn, {"cmd":"GLOBAL","round":r})
+            size, t = send_file(conn, path)
+            print(f"[{now()}] [Server→C{cid}] Sent vec {mb(size):.2f} MB in {t:.3f}s | sha={sha256sum(path)[:10]}..")
+            round_stats[f"sent_MB_C{cid}"] = f"{mb(size):.2f}"
+            round_stats[f"send_time_C{cid}"] = f"{t:.4f}"
+        threads = [threading.Thread(target=send_task, args=(cid,conn)) for cid,conn in conns]
+        [t.start() for t in threads]; [t.join() for t in threads]
 
-        # === Receive LOCAL ===
-        sd_list = []
-        for cid, conn in conns:
-            msg = recv_json(conn)
-            assert msg.get("cmd") == "LOCAL" and msg.get("round") == r
-            local_path = run_dir / f"local_c{cid}_r{r}.pt"
-            sz, t = recv_file(conn, str(local_path))
-            comm_t += t
-            print(f"[Server←C{cid}] local {mb(sz)} in {t:.2f}s")
+        # ---- RECV LOCAL VECS ----
+        local_paths = [None]*NUM_CLIENTS
+        def recv_task(cid, conn):
             try:
-                sd = torch.load(local_path, map_location="cpu", weights_only=True)
-            except:
-                sd = torch.load(local_path, map_location="cpu")
-            sd_list.append(sd)
+                msg = recv_json(conn)
+                assert msg["cmd"]=="LOCAL" and msg["round"]==r
+                p = run_dir / f"local_c{cid}_r{r}.pt"
+                size, t = recv_file(conn, str(p))
+                print(f"[{now()}] [Server←C{cid}] Recv vec {mb(size):.2f} MB in {t:.3f}s | sha={sha256sum(p)[:10]}..")
+                round_stats[f"recv_MB_C{cid}"]  = f"{mb(size):.2f}"
+                round_stats[f"recv_time_C{cid}"]= f"{t:.4f}"
+                local_paths[cid] = p
+            except Exception as e:
+                print(f"[{now()}] [Server←C{cid}] RECV ERROR: {e}")
+        threads = [threading.Thread(target=recv_task, args=(cid,conn)) for cid,conn in conns]
+        [t.start() for t in threads]; [t.join() for t in threads]
 
-        # === Average + Eval ===
+        valid = [p for p in local_paths if p is not None]
+        if not valid:
+            print(f"[{now()}] [Server] No valid vectors received; stopping.")
+            break
+
+        # ---- AVERAGE ----
         t0 = time.perf_counter()
-        avg_sd = avg_state_dict(sd_list)
-        model.load_state_dict(avg_sd)
-        global_path = run_dir / f"global_r{r}.pt"
-        torch.save(avg_sd, global_path)
-        val_acc   = evaluate(val_loader)
-        test_acc  = evaluate(test_loader)
-        train_acc = evaluate(train_loader)
-        val_loss  = compute_loss(val_loader)
-        comp_t = time.perf_counter() - t0
-        mem_mb = proc.memory_info().rss / (1024**2)
+        vecs = [torch.load(p, map_location="cpu").float() for p in valid]
+        avg = torch.stack(vecs, dim=0).mean(dim=0)
+        # apply to server model for evaluation
+        vector_to_params_(server_model, avg.to(DEVICE))
+        # save new global vec
+        new_gpath = run_dir / f"global_r{r}.pt"
+        torch.save(avg.cpu(), new_gpath)
+        if not SAVE_MODEL:
+            for p in valid:
+                try: os.remove(p)
+                except: pass
+        current_global_path = str(new_gpath)
 
-        print(f"Eval r{r} | train={train_acc:.4f} val={val_acc:.4f} test={test_acc:.4f}")
-        print(f"comp={comp_t:.2f}s  comm={comm_t:.2f}s  mem={mem_mb:.1f}MB")
+        # ---- EVAL ----
+        train_acc = eval_acc(server_model, eval_train, DEVICE)
+        val_acc   = eval_acc(server_model, eval_val, DEVICE)
+        test_acc  = eval_acc(server_model, eval_test, DEVICE)
+        eval_time = time.perf_counter() - t0
+        mem_mb    = proc.memory_info().rss/1024/1024
 
-        with open(log_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "step", "loss", "lr", "train_acc", "val_acc", "test_acc", "timestamp",
-                "computation_time", "communication_time", "memory_mb"
-            ])
-            writer.writerow({
-                "step": r,
-                "loss": val_loss,
-                "lr": LR,
-                "train_acc": train_acc,
-                "val_acc": val_acc,
-                "test_acc": test_acc,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "computation_time": f"{comp_t:.4f}",
-                "communication_time": f"{comm_t:.4f}",
-                "memory_mb": f"{mem_mb:.2f}",
-            })
+        # ---- LOG ----
+        row = {
+            "round": r,
+            "train_acc": f"{train_acc:.4f}",
+            "val_acc":   f"{val_acc:.4f}",
+            "test_acc":  f"{test_acc:.4f}",
+            "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "avg_vec_mb_sent": f"{sum(float(round_stats.get(f'sent_MB_C{i}','0') or 0) for i in range(NUM_CLIENTS))/max(1,NUM_CLIENTS):.2f}",
+            "avg_vec_mb_recv": f"{sum(float(round_stats.get(f'recv_MB_C{i}','0') or 0) for i in range(NUM_CLIENTS))/max(1,NUM_CLIENTS):.2f}",
+            "mem_mb": f"{mem_mb:.2f}",
+            "avg_eval_time_sec": f"{eval_time:.4f}",
+        }
+        for i in range(NUM_CLIENTS):
+            row[f"sent_MB_C{i}"]   = round_stats.get(f"sent_MB_C{i}",   "")
+            row[f"send_time_C{i}"] = round_stats.get(f"send_time_C{i}", "")
+            row[f"recv_MB_C{i}"]   = round_stats.get(f"recv_MB_C{i}",   "")
+            row[f"recv_time_C{i}"] = round_stats.get(f"recv_time_C{i}", "")
+        with open(log_csv, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=fieldnames).writerow(row)
 
-    for cid, conn in conns:
-        send_json(conn, {"cmd": "DONE"})
+        print(f"[{now()}] [Server] ROUND {r} | train={train_acc:.4f} val={val_acc:.4f} test={test_acc:.4f}")
+
+    # close
+    for _,conn in conns:
+        try: send_json(conn, {"cmd":"DONE"})
+        except: pass
         conn.close()
-    server.close()
-    print(f"Training complete. Logs saved to: {log_path}")
+    srv.close()
+    print(f"[{now()}] [Server] Finished. Logs -> {log_csv}")
+    # optional final model save
+    if SAVE_MODEL:
+        final_dir = run_dir / "final_model"
+        final_dir.mkdir(exist_ok=True)
+        server_model.save_pretrained(final_dir, safe_serialization=True)
+        print(f"[{now()}] [Server] Final model saved to {final_dir}")
 
 if __name__ == "__main__":
     main()
