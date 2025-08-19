@@ -1,202 +1,276 @@
 #!/usr/bin/env python3
-# zo_server.py -- ZO‑SGD Server: send GLOBAL → recv LOCAL → avg → eval → log
+# 8_train_fed_lora_bp_server.py — FedAvg Server (LoRA + Backprop)
+# ส่ง LoRA adapters → รับ LoRA adapters → เฉลี่ย → ประเมิน
 
-import socket
-import torch
-import json
-import time
-import os
-import shutil
-import csv
-import psutil
+import socket, json, torch, time, csv, shutil, psutil, os, sys, threading, hashlib
+from datetime import datetime
 from pathlib import Path
-from datasets import load_from_disk
-from torch.utils.data import DataLoader
-from transformers import (
-    AutoModelForSequenceClassification,
-    default_data_collator,
-)
-from zo_comm import send_json, recv_json, send_file, recv_file
+from typing import Dict, List
+
+from bp_comm import send_json, recv_json, send_file, recv_file
 import config
 
-# ---------------- SETUP ----------------
+from transformers import AutoModelForSequenceClassification, default_data_collator
+from torch.utils.data import DataLoader
+from datasets import load_from_disk
+
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    TaskType,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+)
+
+# -------------------- CONFIG --------------------
+USE_CPU     = "--use_cpu" in sys.argv
 HOST        = "0.0.0.0"
 PORT        = config.SERVER_PORT
 NUM_CLIENTS = config.NUM_CLIENTS
-ROUNDS      = config.ROUNDS
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-LR          = config.ZO.get("LEARNING_RATE", 1e-4)
 
-ART_DIR   = Path("artifacts_custom")
-META      = json.loads((ART_DIR / "meta.json").read_text())
-MODEL_DIR = Path(META["model_dir"])
-DATA_DIR  = Path(META["dataset_dir"])
+FL = getattr(config, "FED_LORA_BP", getattr(config, "BACKPROP_LORA", {}))
+ROUNDS      = FL.get("ROUNDS", 20)
+LR_GLOBAL   = FL.get("LEARNING_RATE", 5e-5)
+BATCH_SIZE  = FL.get("BATCH_SIZE", 4)
+LOG_EVERY   = FL.get("LOG_EVERY", 2)
+SAVE_MODEL  = FL.get("SAVE_MODEL", False)
+SEED        = getattr(config, "SEED", 42)
 
-# ---------------- OUT DIR ----------------
+# LoRA hyperparams
+LORA_R       = FL.get("LORA_R", 16)
+LORA_ALPHA   = FL.get("LORA_ALPHA", 32)
+LORA_DROPOUT = FL.get("LORA_DROPOUT", 0.1)
+
+DEVICE = "cpu" if USE_CPU else ("cuda" if torch.cuda.is_available() else "cpu")
+
+ART_DIR  = Path("artifacts_custom")
+META     = json.loads((ART_DIR / "meta.json").read_text())
+MODEL_DIR= Path(META["model_dir"])
+DATA_DIR = Path(META["dataset_dir"])
+
 base_output_dir = Path("output/fed_lora_bp/server")
-base_output_dir.mkdir(exist_ok=True)
-runs = [d for d in base_output_dir.iterdir() if d.name.startswith("train_")]
-next_id = max([int(d.name.split("_")[1]) for d in runs], default=0) + 1
+base_output_dir.mkdir(parents=True, exist_ok=True)
+existing = [d for d in base_output_dir.iterdir() if d.name.startswith("train_")]
+next_id = max([int(d.name.split("_")[1]) for d in existing], default=0) + 1
 run_dir = base_output_dir / f"train_{next_id}"
 run_dir.mkdir(parents=True, exist_ok=True)
+if Path("config.py").exists():
+    shutil.copy("config.py", run_dir / "config.py")
 
-shutil.copy("config.py", run_dir / "config.py")
-log_path = run_dir / "log_fed_zo.csv"
+log_csv = run_dir / "log_fed_lora_bp.csv"
+fieldnames = [
+    "step", "loss", "lr", "train_acc", "val_acc", "test_acc",
+    "timestamp", "computation_time", "communication_time", "memory_mb",
+    "send_time_sec", "recv_time_sec", "avg_eval_time_sec"
+]
+for cid in range(NUM_CLIENTS):
+    fieldnames += [f"sent_MB_C{cid}", f"send_time_C{cid}", f"recv_MB_C{cid}", f"recv_time_C{cid}"]
+with open(log_csv, "w", newline="") as f:
+    csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
-with open(log_path, "w", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=[
-        "step", "loss", "lr", "train_acc", "val_acc", "test_acc", "timestamp",
-        "computation_time", "communication_time", "memory_mb"
-    ])
-    writer.writeheader()
-
-# ---------------- DATA ----------------
-ds = load_from_disk(str(DATA_DIR))
-train_loader = DataLoader(ds["train"], batch_size=64, shuffle=False,
-                          collate_fn=default_data_collator)
-val_loader   = DataLoader(ds["validation"], batch_size=64, shuffle=False,
-                          collate_fn=default_data_collator)
-test_loader  = DataLoader(ds["test"], batch_size=64, shuffle=False,
-                          collate_fn=default_data_collator)
-
-# ---------------- MODEL ----------------
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR).to(DEVICE)
+# -------------------- HELPERS --------------------
+def mb(b): return f"{b / 1024 / 1024:.2f}"
+def now(): return datetime.now().strftime("%H:%M:%S")
+def sha256sum(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 @torch.inference_mode()
-def evaluate(loader):
+def eval_split(loader, model):
     model.eval()
-    correct = total = 0
+    correct = total = loss_sum = 0
     for batch in loader:
         labels = batch.pop("labels").to(DEVICE)
-        inputs = {k: v.to(DEVICE) for k, v in batch.items()}
-        logits = model(**inputs).logits
-        correct += (logits.argmax(-1) == labels).sum().item()
+        batch = {k: v.to(DEVICE) for k, v in batch.items()}
+        out = model(**batch, labels=labels)
+        loss_sum += out.loss.item() * labels.size(0)
+        correct += (out.logits.argmax(-1) == labels).sum().item()
         total += labels.size(0)
-    return correct / total
+    return correct / total, loss_sum / total
 
-@torch.inference_mode()
-def compute_loss(loader):
-    model.eval()
-    total_loss = 0.0
-    total = 0
-    for batch in loader:
-        labels = batch.pop("labels").to(DEVICE)
-        inputs = {k: v.to(DEVICE) for k, v in batch.items()}
-        out = model(**inputs, labels=labels)
-        total_loss += out.loss.item() * labels.size(0)
-        total += labels.size(0)
-    return total_loss / total
-
-def avg_state_dict(list_of_sd):
+def avg_state_dict(states: List[Dict[str, torch.Tensor]]):
+    keys = list(states[0].keys())
     avg = {}
-    for k in list_of_sd[0].keys():
-        avg[k] = sum(sd[k] for sd in list_of_sd) / len(list_of_sd)
+    for k in keys:
+        avg[k] = torch.stack([s[k] for s in states], dim=0).mean(dim=0)
     return avg
 
-# ---------------- HELPERS ----------------
-def mb(bytes_): 
-    return f"{bytes_ / 1024**2:.2f} MB"
+# --- Backward-compatible setter for PEFT state dict ---
+def safe_set_peft_model_state_dict(model, peft_sd):
+    """
+    รองรับทั้ง peft ใหม่/เก่า:
+    - ใหม่: พยายามเรียกด้วย strict=False
+    - เก่า: TypeError -> กรองคีย์ให้เหลือเฉพาะที่โมเดลนี้มี แล้วค่อยใส่
+    """
+    try:
+        set_peft_model_state_dict(model, peft_sd, strict=False)  # อาจ TypeError ถ้า peft เก่า
+        return
+    except TypeError:
+        pass
+    current = get_peft_model_state_dict(model)  # คีย์ที่โมเดลนี้คาดหวัง
+    filtered = {k: v for k, v in peft_sd.items() if k in current}
+    set_peft_model_state_dict(model, filtered)
 
-def count_params(state_dict):
-    """Count total elements in a state_dict."""
-    return sum(v.numel() for v in state_dict.values())
+# -------------------- DATA & MODEL --------------------
+ds_all = load_from_disk(str(DATA_DIR))
+train_dl = DataLoader(ds_all["train"].shuffle(seed=SEED).select(range(600)), batch_size=64, collate_fn=default_data_collator)
+val_dl   = DataLoader(ds_all["validation"], batch_size=64, collate_fn=default_data_collator)
+test_dl  = DataLoader(ds_all["test"], batch_size=64, collate_fn=default_data_collator)
 
-# ---------------- MAIN ----------------
+base_model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR, local_files_only=True)
+lora_cfg = LoraConfig(
+    task_type=TaskType.SEQ_CLS,
+    inference_mode=False,
+    r=LORA_R,
+    lora_alpha=LORA_ALPHA,
+    lora_dropout=LORA_DROPOUT,
+    # สำคัญ: ระบุ target modules ของ OPT ให้ชัดเจน
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+)
+server_model = get_peft_model(base_model, lora_cfg).to(DEVICE)
+
+# Initial global LoRA state (round 0)
+init_path = run_dir / "lora_global_r0.pt"
+if not init_path.exists():
+    torch.save(get_peft_model_state_dict(server_model), init_path)
+
+proc = psutil.Process(os.getpid())
+
+# -------------------- MAIN --------------------
 def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((HOST, PORT))
-    server.listen(NUM_CLIENTS)
-    print(f"[Server] Listening on {HOST}:{PORT}")
+    print(f"[{now()}] [Server] Starting on {DEVICE}")
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind((HOST, PORT))
+    srv.listen(NUM_CLIENTS)
 
     conns = []
-    for i in range(NUM_CLIENTS):
-        conn, addr = server.accept()
-        print(f"[Server] Client {i} connected from {addr}")
-        conns.append((i, conn))
+    for cid in range(NUM_CLIENTS):
+        conn, addr = srv.accept()
+        print(f"[{now()}] [Server] Client {cid} connected from {addr}")
+        conns.append((cid, conn))
 
-    proc = psutil.Process(os.getpid())
-
-    # save initial global weights
-    global_path = run_dir / "global_r0.pt"
-    torch.save(model.state_dict(), global_path)
+    # ใช้ path โลคัลสำหรับ global LoRA ปัจจุบัน
+    current_global_path = str(init_path)
 
     for r in range(1, ROUNDS + 1):
-        print(f"\nRound {r}")
-        comm_t = 0.0
+        print(f"\n[{now()}] [Server] === ROUND {r} START ===")
+        client_stats = {}
 
-        # === Send GLOBAL ===
-        global_sd = torch.load(global_path, map_location="cpu", weights_only=True)
-        num_global = count_params(global_sd)
-        for cid, conn in conns:
-            print(f"[Server→C{cid}] Sending GLOBAL round {r} | params={num_global}")
-            send_json(conn, {"cmd": "GLOBAL", "round": r})
-            sz, t = send_file(conn, str(global_path))
-            comm_t += t
-            print(f"[Server→C{cid}] global {mb(sz)} in {t:.2f}s")
+        # ---- bind path ของรอบนี้ให้ threads ----
+        path_to_send = current_global_path
 
-        # === Receive LOCAL ===
-        sd_list = []
-        for cid, conn in conns:
-            msg = recv_json(conn)
-            assert msg.get("cmd") == "LOCAL" and msg.get("round") == r
-            local_path = run_dir / f"local_c{cid}_r{r}.pt"
-            sz, t = recv_file(conn, str(local_path))
-            comm_t += t
-
-            # load local update
+        def send_task(cid, conn, path=path_to_send):
             try:
-                local_sd = torch.load(local_path, map_location="cpu", weights_only=True)
-            except TypeError:
-                local_sd = torch.load(local_path, map_location="cpu")
+                print(f"[{now()}] [Server→C{cid}] Sending {Path(path).name}")
+                send_json(conn, {"cmd": "GLOBAL", "round": r})
+                size, t = send_file(conn, path)
+                hash_val = sha256sum(path)
+                print(f"[{now()}] [Server→C{cid}] SHA256 = {hash_val}")
+                print(f"[{now()}] [Server→C{cid}] Sent {mb(size)} in {t:.3f}s")
+                client_stats[cid] = {
+                    f"sent_MB_C{cid}": mb(size),
+                    f"send_time_C{cid}": f"{t:.4f}",
+                }
+            except Exception as e:
+                print(f"[{now()}] [Server→C{cid}] SEND ERROR: {e}")
+                client_stats[cid] = {f"sent_MB_C{cid}": "0.00", f"send_time_C{cid}": "0.0000"}
 
-            num_local = count_params(local_sd)
-            print(f"[Server←C{cid}] Received LOCAL round {r} | params={num_local}")
-            print(f"[Server←C{cid}] local {mb(sz)} in {t:.2f}s")
+        send_threads = [threading.Thread(target=send_task, args=(cid, conn)) for cid, conn in conns]
+        [t.start() for t in send_threads]
+        [t.join() for t in send_threads]
 
-            sd_list.append(local_sd)
+        # ---- recv LOCAL LoRA ----
+        local_paths = [None] * NUM_CLIENTS
 
-        # === Average + Eval ===
+        def recv_task(cid, conn):
+            try:
+                print(f"[{now()}] [Server←C{cid}] Waiting for LOCAL adapters...")
+                msg = recv_json(conn)
+                assert msg["cmd"] == "LOCAL" and msg["round"] == r
+                path = run_dir / f"lora_local_c{cid}_r{r}.pt"
+                size, t = recv_file(conn, str(path))
+                hash_val = sha256sum(path)
+                print(f"[{now()}] [Server←C{cid}] SHA256 = {hash_val}")
+                print(f"[{now()}] [Server←C{cid}] Received {mb(size)} in {t:.3f}s")
+                client_stats[cid][f"recv_MB_C{cid}"] = mb(size)
+                client_stats[cid][f"recv_time_C{cid}"] = f"{t:.4f}"
+                local_paths[cid] = path
+            except Exception as e:
+                print(f"[{now()}] [Server←C{cid}] RECV ERROR: {e}")
+                client_stats.setdefault(cid, {})
+                client_stats[cid][f"recv_MB_C{cid}"] = client_stats[cid].get(f"recv_MB_C{cid}", "0.00")
+                client_stats[cid][f"recv_time_C{cid}"] = client_stats[cid].get(f"recv_time_C{cid}", "0.0000")
+
+        recv_threads = [threading.Thread(target=recv_task, args=(cid, conn)) for cid, conn in conns]
+        [t.start() for t in recv_threads]
+        [t.join() for t in recv_threads]
+
+        print(f"[{now()}] [Server] Averaging and evaluating...")
         t0 = time.perf_counter()
-        avg_sd = avg_state_dict(sd_list)
-        model.load_state_dict(avg_sd)
-        global_path = run_dir / f"global_r{r}.pt"
-        torch.save(avg_sd, global_path)
 
-        train_acc = evaluate(train_loader)
-        val_acc   = evaluate(val_loader)
-        test_acc  = evaluate(test_loader)
-        val_loss  = compute_loss(val_loader)
+        valid_paths = [p for p in local_paths if p is not None]
+        if len(valid_paths) == 0:
+            print(f"[{now()}] [Server] No valid local adapters received; stopping.")
+            break
 
-        comp_t = time.perf_counter() - t0
-        mem_mb = proc.memory_info().rss / (1024**2)
+        states = [torch.load(p, map_location="cpu") for p in valid_paths]
+        global_lora_sd = avg_state_dict(states)
 
-        print(f"Eval r{r} | train={train_acc:.4f} val={val_acc:.4f} test={test_acc:.4f}")
-        print(f"comp={comp_t:.2f}s  comm={comm_t:.2f}s  mem={mem_mb:.1f}MB")
+        # apply averaged LoRA to server model (รองรับ peft เก่า/ใหม่)
+        safe_set_peft_model_state_dict(server_model, global_lora_sd)
 
-        with open(log_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "step", "loss", "lr", "train_acc", "val_acc", "test_acc", "timestamp",
-                "computation_time", "communication_time", "memory_mb"
-            ])
-            writer.writerow({
-                "step": r,
-                "loss": val_loss,
-                "lr": LR,
-                "train_acc": train_acc,
-                "val_acc": val_acc,
-                "test_acc": test_acc,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "computation_time": f"{comp_t:.4f}",
-                "communication_time": f"{comm_t:.4f}",
-                "memory_mb": f"{mem_mb:.2f}",
-            })
+        # save global LoRA และอัปเดต path สำหรับรอบถัดไป
+        new_global_path = run_dir / f"lora_global_r{r}.pt"
+        torch.save(global_lora_sd, new_global_path)
+        current_global_path = str(new_global_path)
 
-    # signal DONE
-    for cid, conn in conns:
-        send_json(conn, {"cmd": "DONE"})
+        # clean local files if not saving
+        if not SAVE_MODEL:
+            for p in valid_paths:
+                try:
+                    if p.exists():
+                        os.remove(p)
+                except Exception:
+                    pass
+
+        # evaluate
+        train_acc, _  = eval_split(train_dl, server_model)
+        val_acc, loss = eval_split(val_dl,   server_model)
+        test_acc, _   = eval_split(test_dl,  server_model)
+
+        eval_time = time.perf_counter() - t0
+        mem_mb    = proc.memory_info().rss / (1024 ** 2)
+
+        print(
+            f"[{now()}] [Server] ROUND {r} EVAL → train_acc={train_acc:.4f} "
+            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f} | "
+            f"comp={eval_time:.2f}s comm=N/A mem={mem_mb:.1f}MB"
+        )
+
+        row = {
+            "step": r, "loss": loss, "lr": LR_GLOBAL,
+            "train_acc": train_acc, "val_acc": val_acc, "test_acc": test_acc,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "computation_time": f"{eval_time:.4f}", "communication_time": "0.0000",
+            "memory_mb": f"{mem_mb:.2f}", "send_time_sec": "0.0000",
+            "recv_time_sec": "0.0000", "avg_eval_time_sec": f"{eval_time:.4f}",
+        }
+        for cid in range(NUM_CLIENTS):
+            row.update(client_stats.get(cid, {}))
+
+        with open(log_csv, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=row.keys()).writerow(row)
+
+        print(f"[{now()}] [Server] === ROUND {r} END ===")
+
+    for _, conn in conns:
+        try:
+            send_json(conn, {"cmd": "DONE"})
+        except Exception:
+            pass
         conn.close()
-    server.close()
-    print(f"Training complete. Logs saved to: {log_path}")
+    srv.close()
+    print(f"[{now()}] [Server] Training completed. Logs saved at {log_csv}")
 
 if __name__ == "__main__":
     main()
